@@ -1,0 +1,5 @@
+.venv/
+model/
+voice/
+Output_audio/
+dxdiag_output.txt
