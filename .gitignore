@@ -3,3 +3,4 @@ model/
 voice/
 Output_audio/
 dxdiag_output.txt
+requirements_local.txt
