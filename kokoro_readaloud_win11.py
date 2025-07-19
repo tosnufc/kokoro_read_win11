@@ -2,6 +2,8 @@ import os
 import re
 import sys
 import time
+import queue
+import threading
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -26,13 +28,14 @@ class OptimizedTTSReader:
         self.audio_stream = None
         self.pyaudio_instance = None
         
-        # Optimal settings from testing (linux_optimized strategy)
-        self.cpu_count = os.cpu_count() or 4
-        self.max_threads = 2  # Proven optimal
-        self.chunk_words = 100  # Moderate chunks work best
+        # Streaming settings
+        self.audio_queue = queue.Queue()
+        self.processing_queue = queue.Queue()
+        self.is_playing = False
+        self.is_processing = False
         
-        print(f"🚀 Optimized TTS: 2.9x real-time speed (proven)")
-        print(f"🖥️ System: {self.cpu_count} cores, FP16 model, 2 threads")
+        print(f"🚀 Streaming TTS: Process while playing")
+        print(f"🖥️ System: {os.cpu_count() or 4} cores, FP16 model")
         
     def optimize_system(self):
         """Apply Linux-style ONNX optimizations"""
@@ -40,8 +43,8 @@ class OptimizedTTSReader:
             psutil.Process().nice(psutil.HIGH_PRIORITY_CLASS)
             
             # Linux-style ONNX optimizations that work great on Windows
-            os.environ['ORT_NUM_THREADS'] = str(self.cpu_count)
-            os.environ['OMP_NUM_THREADS'] = str(self.cpu_count)
+            os.environ['ORT_NUM_THREADS'] = str(os.cpu_count() or 4)
+            os.environ['OMP_NUM_THREADS'] = str(os.cpu_count() or 4)
             os.environ['ORT_ENABLE_CPU_FP16_OPS'] = '1'
             os.environ['ORT_ENABLE_ALL_OPTIMIZATIONS'] = '1'
             os.environ['ORT_DISABLE_TRT_FLASH_ATTENTION'] = '0'
@@ -103,88 +106,107 @@ class OptimizedTTSReader:
         print("✅ Ready!")
         return True
     
-    def chunk_text(self, text):
-        """Split text into optimal chunks"""
-        if not text or len(text.split()) <= self.chunk_words:
-            return [text.strip()]
+    def split_into_sentences(self, text):
+        """Split text into sentences for streaming"""
+        if not text or not text.strip():
+            return []
         
-        sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text)
-        chunks = []
-        current_chunk = []
-        current_words = 0
+        # Split by sentence endings, preserving punctuation
+        sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text.strip())
         
+        # Clean up sentences
+        cleaned_sentences = []
         for sentence in sentences:
             sentence = sentence.strip()
-            if not sentence:
-                continue
-                
-            words = len(sentence.split())
-            
-            if current_words + words > self.chunk_words and current_chunk:
-                chunks.append(' '.join(current_chunk))
-                current_chunk = [sentence]
-                current_words = words
-            else:
-                current_chunk.append(sentence)
-                current_words += words
+            if sentence and len(sentence) > 1:  # Skip empty or single character sentences
+                cleaned_sentences.append(sentence)
         
-        if current_chunk:
-            chunks.append(' '.join(current_chunk))
-        
-        return chunks if chunks else [text]
+        return cleaned_sentences
     
-    def generate_chunk(self, text, voice='af_heart', speed=1.2):
-        """Generate audio for one chunk"""
-        if not text.strip() or self.kokoro is None:
+    def generate_sentence_audio(self, sentence, voice='af_heart', speed=1.2):
+        """Generate audio for one sentence"""
+        if not sentence.strip() or self.kokoro is None:
             return None
         
         try:
-            samples, sample_rate = self.kokoro.create(text, voice=voice, speed=speed, lang="en-us")
+            samples, sample_rate = self.kokoro.create(sentence, voice=voice, speed=speed, lang="en-us")
             return (samples, sample_rate)
-        except Exception:
+        except Exception as e:
+            print(f"❌ Error generating audio for sentence: {e}")
             return None
     
-    def generate_audio(self, text_chunks):
-        """Generate audio using optimal 2-thread processing"""
-        print(f"🚀 Processing {len(text_chunks)} chunks with 2 threads...")
+    def audio_processor(self, sentences, voice='af_heart', speed=1.2):
+        """Process sentences and add to audio queue"""
+        self.is_processing = True
+        print(f"🔄 Processing {len(sentences)} sentences...")
         
-        start_time = time.time()
-        all_chunks = []
-        
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = [(i, executor.submit(self.generate_chunk, chunk)) for i, chunk in enumerate(text_chunks)]
+        for i, sentence in enumerate(sentences):
+            if not self.is_processing:  # Check if we should stop
+                break
+                
+            print(f"⚡ Processing sentence {i+1}/{len(sentences)}: {sentence[:50]}...")
             
-            for chunk_idx, future in futures:
+            audio_data = self.generate_sentence_audio(sentence, voice, speed)
+            if audio_data:
+                self.audio_queue.put((i, audio_data))
+                print(f"✅ Sentence {i+1} ready for playback")
+            else:
+                print(f"❌ Failed to process sentence {i+1}")
+        
+        # Signal end of processing
+        self.audio_queue.put(None)
+        self.is_processing = False
+        print("🏁 Processing complete")
+    
+    def audio_player(self):
+        """Play audio from queue"""
+        self.is_playing = True
+        print("🔊 Starting audio playback...")
+        
+        if not self.initialize_audio():
+            print("❌ Failed to initialize audio")
+            self.is_playing = False
+            return
+        
+        try:
+            while self.is_playing:
                 try:
-                    result = future.result(timeout=60)
-                    if result:
-                        all_chunks.append((chunk_idx, result))
-                except Exception:
-                    pass
-        
-        # Sort and combine
-        all_chunks.sort(key=lambda x: x[0])
-        
-        if not all_chunks:
-            return None
-        
-        # Combine audio
-        combined_samples = []
-        sample_rate = all_chunks[0][1][1]
-        
-        for _, (samples, _) in all_chunks:
-            combined_samples.extend(samples)
-        
-        combined_samples = np.array(combined_samples, dtype=np.float32)
-        
-        total_time = time.time() - start_time
-        audio_duration = len(combined_samples) / sample_rate
-        speed_factor = audio_duration / total_time if total_time > 0 else 0
-        
-        print(f"✅ Generated {audio_duration:.1f}s audio in {total_time:.1f}s")
-        print(f"🚀 Speed: {speed_factor:.1f}x real-time")
-        
-        return (combined_samples, sample_rate)
+                    # Get audio data from queue with timeout
+                    item = self.audio_queue.get(timeout=1.0)
+                    
+                    if item is None:  # End signal
+                        break
+                    
+                    sentence_idx, audio_data = item
+                    samples, sample_rate = audio_data
+                    
+                    print(f"🎵 Playing sentence {sentence_idx + 1}...")
+                    
+                    # Play the audio
+                    audio_data_int16 = (np.asarray(samples) * 32767).astype(np.int16)
+                    chunk_size = self.chunk_size * 4
+                    
+                    if self.audio_stream is not None:
+                        for i in range(0, len(audio_data_int16), chunk_size):
+                            if not self.is_playing:  # Check if we should stop
+                                break
+                            chunk = audio_data_int16[i:i + chunk_size]
+                            self.audio_stream.write(chunk.tobytes())
+                    
+                    print(f"✅ Sentence {sentence_idx + 1} played")
+                    
+                except queue.Empty:
+                    # No audio data available, check if processing is still ongoing
+                    if not self.is_processing:
+                        break
+                    continue
+                    
+        except Exception as e:
+            print(f"❌ Audio playback error: {e}")
+        finally:
+            self.cleanup_audio()
+            self.is_playing = False
+            print("🔇 Audio playback stopped")
     
     def initialize_audio(self):
         """Initialize audio"""
@@ -215,17 +237,13 @@ class OptimizedTTSReader:
         except Exception:
             pass
     
-    def save_and_play(self, audio_data):
-        """Save and play audio"""
-        if not audio_data:
-            return False
-        
+    def save_audio(self, audio_data, filename='output.wav'):
+        """Save audio to file"""
         try:
             samples, sample_rate = audio_data
             
-            # Save
             self.output_dir.mkdir(exist_ok=True)
-            output_path = self.output_dir / 'output.wav'
+            output_path = self.output_dir / filename
             
             max_val = np.max(np.abs(samples))
             if max_val > 0:
@@ -233,32 +251,15 @@ class OptimizedTTSReader:
             
             sf.write(str(output_path), samples, sample_rate)
             print(f"💾 Saved: {output_path}")
-            
-            # Play
-            print("🔊 Playing...")
-            if not self.initialize_audio():
-                return False
-            
-            audio_data_int16 = (np.asarray(samples) * 32767).astype(np.int16)
-            chunk_size = self.chunk_size * 4
-            
-            if self.audio_stream is not None:
-                for i in range(0, len(audio_data_int16), chunk_size):
-                    chunk = audio_data_int16[i:i + chunk_size]
-                    self.audio_stream.write(chunk.tobytes())
-            
-            print("✅ Done!")
             return True
-            
-        except Exception:
+        except Exception as e:
+            print(f"❌ Failed to save audio: {e}")
             return False
-        finally:
-            self.cleanup_audio()
     
     def run(self):
-        """Main execution"""
-        print("=== Optimized Windows TTS ===")
-        print("🎯 Using fastest proven strategy")
+        """Main execution with streaming"""
+        print("=== Streaming TTS ===")
+        print("🎯 Process while playing strategy")
         print()
         
         try:
@@ -271,22 +272,48 @@ class OptimizedTTSReader:
             print(f"✅ Text: {len(text)} characters")
             print()
             
-            # Initialize
+            # Initialize TTS
             if not self.initialize_tts():
                 return False
             
-            # Process
-            text_chunks = self.chunk_text(text.strip())
-            audio_data = self.generate_audio(text_chunks)
-            
-            if audio_data and self.save_and_play(audio_data):
-                print("🎉 Success!")
-                return True
-            else:
+            # Split into sentences
+            sentences = self.split_into_sentences(text)
+            if not sentences:
+                print("❌ No valid sentences found")
                 return False
+            
+            print(f"📝 Found {len(sentences)} sentences")
+            print()
+            
+            # Start processing and playing threads
+            start_time = time.time()
+            
+            # Start audio processor thread
+            processor_thread = threading.Thread(
+                target=self.audio_processor, 
+                args=(sentences, 'af_heart', 1.2)
+            )
+            processor_thread.daemon = True
+            processor_thread.start()
+            
+            # Start audio player thread
+            player_thread = threading.Thread(target=self.audio_player)
+            player_thread.daemon = True
+            player_thread.start()
+            
+            # Wait for both threads to complete
+            processor_thread.join()
+            player_thread.join()
+            
+            total_time = time.time() - start_time
+            print(f"⏱️ Total time: {total_time:.1f}s")
+            
+            return True
                 
         except KeyboardInterrupt:
             print("\n⚠️ Cancelled")
+            self.is_processing = False
+            self.is_playing = False
             return False
         except Exception as e:
             print(f"❌ Error: {e}")
@@ -296,7 +323,7 @@ class OptimizedTTSReader:
 
 def main():
     """Entry point"""
-    print("🚀 Starting optimized TTS...")
+    print("🚀 Starting streaming TTS...")
     
     # Set high priority
     try:
@@ -310,7 +337,7 @@ def main():
     success = reader.run()
     
     if success:
-        print("🎊 2.9x real-time speed achieved!")
+        print("🎊 Streaming completed!")
     else:
         print("❌ Failed")
     
